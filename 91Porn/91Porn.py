@@ -6,6 +6,7 @@
 
 已修改: 默认不再固定为热门(category=top)，默认不带 category 查询参数以抓取全部视频。
 新增: CLI 参数 --category 可用于指定单个分类（例如 "top"、"new" 等）。
+新增: 支持通过 --series-url 抓取 xchina 系列页面（单页模式）。
 """
 
 import argparse
@@ -129,6 +130,7 @@ class Porn91Spider:
         stream_output: bool = False,
         stream_protocol: str = "legacy",
         category: str = None,
+        series_url: str = None,
     ):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -147,6 +149,8 @@ class Porn91Spider:
         self.stream_protocol = stream_protocol or "legacy"
         # 新增: 支持按分类抓取，None 或空字符串表示不带 category（抓取全部）
         self.category = category.strip() if isinstance(category, str) and category.strip() else None
+        # 新增: 支持抓取单个外部系列页（例如 xchina 系列页）
+        self.series_url = series_url.strip() if isinstance(series_url, str) and series_url.strip() else None
 
         try:
             from requests.adapters import HTTPAdapter
@@ -356,6 +360,60 @@ class Porn91Spider:
         text = re.sub(r'\s+', ' ', text).strip()
         return html.unescape(text)[:120]
 
+    def parse_xchina_series_page(self, html: str) -> list:
+        """解析 xchina-like 的系列页面，提取出单页内的所有视频条目（单页模式）。
+
+        目标页面示例: https://xchina.co/videos/series-63824a975d8ae.html
+        解析策略:
+          - 查找 href 包含 "/videos/" 的链接作为视频详情页
+          - 过滤掉包含 "series-" 的链接（避免再次匹配系列页自身）
+          - 尽量从链接或子元素中提取标题和缩略图
+        """
+        videos = []
+        if not html:
+            return videos
+        base = self.series_url or BASE_URL
+        soup = BeautifulSoup(html, 'lxml')
+        seen = set()
+
+        for a in soup.select('a[href]'):
+            href = a.get('href') or ''
+            if '/videos/' not in href:
+                continue
+            if 'series-' in href:
+                # 跳过系列页自身
+                continue
+            detail_url = urljoin(base, href)
+            # 去重
+            if detail_url in seen:
+                continue
+            seen.add(detail_url)
+
+            title = a.get('title') or a.get_text(separator=' ', strip=True)
+            title = html.unescape(title or '')[:160]
+
+            thumb_url = ''
+            img = a.find('img')
+            if img:
+                src = img.get('src') or img.get('data-src') or img.get('data-original') or ''
+                if src:
+                    thumb_url = urljoin(base, src)
+
+            # 生成一个 viewkey-like 标识（取路径最后一段无扩展名）
+            parsed = urlparse(detail_url)
+            name = os.path.basename(parsed.path)
+            vk = os.path.splitext(name)[0] or detail_url
+
+            videos.append({
+                'title': title,
+                'detail_url': detail_url,
+                'thumb_url': thumb_url,
+                'viewkey': vk,
+                'source_id': ''
+            })
+
+        return videos
+
     def parse_detail_page(self, html: str) -> dict:
         result = {}
 
@@ -383,7 +441,7 @@ class Porn91Spider:
                 self.log(f"  解码 strencode2 失败: {e}")
 
         mp4_match = re.search(
-            r'https?://[^\s"\'"<>]+\.mp4[^\s"\'"<>]*',
+            r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*',
             html
         )
         if mp4_match:
@@ -453,6 +511,8 @@ class Porn91Spider:
             self.log(f"配置: 指定分类 category={self.category}")
         else:
             self.log("配置: 未指定 category，默认抓取全部视频")
+        if self.series_url:
+            self.log(f"配置: 指定系列页 series_url={self.series_url} (单页模式)")
         self.log("")
 
         page_num = self.start_page
@@ -470,16 +530,19 @@ class Porn91Spider:
                 self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
                 break
 
-            # 构建基础列表页 URL：如果指定了 category 则带上，否则只使用 viewtype=basic（可返回全部）
-            if self.category:
-                base_url = f"{BASE_URL}?category={self.category}&viewtype=basic"
+            # 构建基础列表页 URL：如果指定了 series_url 则抓取该页面（单页），否则按原有列表逻辑
+            if self.series_url:
+                page_url = self.series_url
             else:
-                base_url = f"{BASE_URL}?viewtype=basic"
+                if self.category:
+                    base_url = f"{BASE_URL}?category={self.category}&viewtype=basic"
+                else:
+                    base_url = f"{BASE_URL}?viewtype=basic"
 
-            if page_num == 1:
-                page_url = base_url
-            else:
-                page_url = f"{base_url}&page={page_num}"
+                if page_num == 1:
+                    page_url = base_url
+                else:
+                    page_url = f"{base_url}&page={page_num}"
 
             if crawled_in_session > 0:
                 self.log("")
@@ -493,15 +556,25 @@ class Porn91Spider:
                 consecutive_empty += 1
                 page_num += 1
                 crawled_in_session += 1
+                # 如果是 series 单页模式，失败后直接结束
+                if self.series_url:
+                    break
                 continue
 
-            page_videos = self.parse_list_page(page_html)
+            # 解析页面：系列页使用专用解析，否则使用原有解析
+            if self.series_url:
+                page_videos = self.parse_xchina_series_page(page_html)
+            else:
+                page_videos = self.parse_list_page(page_html)
 
             if not page_videos:
                 self.log(f"[页 {page_num}] 页面无视频，可能已到末尾")
                 consecutive_empty += 1
                 page_num += 1
                 crawled_in_session += 1
+                # 系列单页模式遇到空结果也结束
+                if self.series_url:
+                    break
                 continue
 
             consecutive_empty = 0
@@ -519,6 +592,10 @@ class Porn91Spider:
             self.pages_crawled += 1
             page_num += 1
             crawled_in_session += 1
+
+            # 如果是 series 单页模式，抓取完后立即结束
+            if self.series_url:
+                break
 
         self._save_results()
         self._print_summary()
@@ -763,7 +840,7 @@ def main():
     parser.add_argument("--quiet", action="store_true",
                         help="压缩日志，每条视频只输出关键事件")
     parser.add_argument("--target-new", type=int, default=None,
-                        help="目��新增模式：从 page 1 起翻页直到累计处理这么多新源视频后停止（backend 凌晨任务用）")
+                        help="目标新增模式：从 page 1 起翻页直到累计处理这么多新源视频后停止（backend 凌晨任务用）")
     parser.add_argument("--seen-viewkeys-file", type=str, default=None,
                         help="文件路径，每行一个已处理过的 viewkey 或 mp4 源 ID；脚本会跳过这些视频")
     parser.add_argument("--stream-output", action="store_true",
@@ -774,6 +851,9 @@ def main():
     # 新增: 支持指定 category（默认为 None，表示不带 category，抓取全部）
     parser.add_argument("--category", type=str, default=None,
                         help="分类，默认空表示抓取全部视频；例如 --category top")
+    # 新增: 支持指定外部系列页（单页模式），例如 xchina 系列页
+    parser.add_argument("--series-url", type=str, default=None,
+                        help="系列页面 URL（单页模式），例如 --series-url https://xchina.co/videos/series-63824a975d8ae.html")
 
     args, _ = parser.parse_known_args()
     if args.job:
@@ -814,6 +894,7 @@ def main():
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
             category=args.category,
+            series_url=args.series_url,
         )
     elif args.page is not None:
         start_page = max(1, args.page)
@@ -827,6 +908,7 @@ def main():
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
             category=args.category,
+            series_url=args.series_url,
         )
     else:
         spider = Porn91Spider(
@@ -836,6 +918,7 @@ def main():
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
             category=args.category,
+            series_url=args.series_url,
         )
 
     try:
