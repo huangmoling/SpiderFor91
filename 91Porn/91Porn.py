@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 脚本名称: 91Porn
-用途: 爬取 91Porn 热门列表中的视频标题、视频下载直链、封面图直链和唯一标识，
+用途: 爬取 91Porn 列表中的视频标题、视频下载直链、封面图直链和唯一标识，
 并按 crawler.v1 协议输出给 video-site-91 后端入库。
+
+已修改: 默认不再固定为热门(category=top)，默认不带 category 查询参数以抓取全部视频。
+新增: CLI 参数 --category 可用于指定单个分类（例如 "top"、"new" 等）。
 """
 
 import argparse
@@ -47,8 +50,9 @@ def prefer_ipv4_for_plain_socks5_proxy():
     socket._spider91_ipv4_first = True
 
 BASE_URL = "https://www.91porn.com/v.php"
+# LIST_PARAMS 不再固定为热门，保留配置位置以供扩展
 LIST_PARAMS = {
-    "category": "top",
+    # "category": "top",
     "viewtype": "basic"
 }
 
@@ -124,6 +128,7 @@ class Porn91Spider:
         seen_viewkeys: list = None,
         stream_output: bool = False,
         stream_protocol: str = "legacy",
+        category: str = None,
     ):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -140,6 +145,8 @@ class Porn91Spider:
         self.quiet = bool(quiet)
         self.stream_output = bool(stream_output)
         self.stream_protocol = stream_protocol or "legacy"
+        # 新增: 支持按分类抓取，None 或空字符串表示不带 category（抓取全部）
+        self.category = category.strip() if isinstance(category, str) and category.strip() else None
 
         try:
             from requests.adapters import HTTPAdapter
@@ -376,7 +383,7 @@ class Porn91Spider:
                 self.log(f"  解码 strencode2 失败: {e}")
 
         mp4_match = re.search(
-            r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*',
+            r'https?://[^\s"'""<>]+\.mp4[^\s"'""<>]*',
             html
         )
         if mp4_match:
@@ -442,6 +449,10 @@ class Porn91Spider:
         self.log(f"配置: 输出文件 {os.path.abspath(self.output_file)}")
         if self.skip_viewkeys:
             self.log(f"配置: 已跳过 {len(self.skip_viewkeys)} 个已知 viewkey")
+        if self.category:
+            self.log(f"配置: 指定分类 category={self.category}")
+        else:
+            self.log("配置: 未指定 category，默认抓取全部视频")
         self.log("")
 
         page_num = self.start_page
@@ -459,10 +470,16 @@ class Porn91Spider:
                 self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
                 break
 
-            if page_num == 1:
-                page_url = f"{BASE_URL}?category=top&viewtype=basic"
+            # 构建基础列表页 URL：如果指定了 category 则带上，否则只使用 viewtype=basic（可返回全部）
+            if self.category:
+                base_url = f"{BASE_URL}?category={self.category}&viewtype=basic"
             else:
-                page_url = f"{BASE_URL}?category=top&viewtype=basic&page={page_num}"
+                base_url = f"{BASE_URL}?viewtype=basic"
+
+            if page_num == 1:
+                page_url = base_url
+            else:
+                page_url = f"{base_url}&page={page_num}"
 
             if crawled_in_session > 0:
                 self.log("")
@@ -619,7 +636,7 @@ def print_help():
     91porn 视频爬虫 v1.0
 ================================================
 
-本脚本将爬取 91porn "本月最热" 分类下的所有视频信息：
+本脚本将爬取 91porn 列表下的所有视频信息：
   - 视频名称
   - 封面图直链
   - 视频直链 (MP4)
@@ -754,6 +771,9 @@ def main():
                              "日志改走 stderr。配合 backend 边读边下载使用。")
     parser.add_argument("--job", type=str, default=None,
                         help="crawler.v1 job JSON 路径；作为通用脚本爬虫运行。")
+    # 新增: 支持指定 category（默认为 None，表示不带 category，抓取全部）
+    parser.add_argument("--category", type=str, default=None,
+                        help="分类，默认空表示抓取全部视频；例如 --category top")
 
     args, _ = parser.parse_known_args()
     if args.job:
@@ -793,6 +813,7 @@ def main():
             target_new=args.target_new,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            category=args.category,
         )
     elif args.page is not None:
         start_page = max(1, args.page)
@@ -805,6 +826,7 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            category=args.category,
         )
     else:
         spider = Porn91Spider(
@@ -813,6 +835,7 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            category=args.category,
         )
 
     try:
